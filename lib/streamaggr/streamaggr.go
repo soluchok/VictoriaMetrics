@@ -342,6 +342,17 @@ func (a *Aggregators) loadAggregatorsFromData(data []byte) error {
 	return nil
 }
 
+// IsEnabled returns true if Aggregators has at least one configured aggregator
+func (a *Aggregators) IsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if len(a.as) == 0 {
+		return false
+	}
+	return true
+}
+
 // MustStop stops a.
 func (a *Aggregators) MustStop(ignoreAggrHashes []uint64) {
 	if a == nil {

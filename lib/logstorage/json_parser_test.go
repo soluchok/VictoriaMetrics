@@ -1,22 +1,20 @@
-package logjson
+package logstorage
 
 import (
 	"reflect"
 	"testing"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logstorage"
 )
 
-func TestParserFailure(t *testing.T) {
+func TestJSONParserFailure(t *testing.T) {
 	f := func(data string) {
 		t.Helper()
 
-		p := GetParser()
+		p := GetJSONParser()
 		err := p.ParseLogMessage([]byte(data))
 		if err == nil {
 			t.Fatalf("expecting non-nil error")
 		}
-		PutParser(p)
+		PutJSONParser(p)
 	}
 	f("")
 	f("{foo")
@@ -24,11 +22,11 @@ func TestParserFailure(t *testing.T) {
 	f(`{"foo",}`)
 }
 
-func TestParserSuccess(t *testing.T) {
-	f := func(data string, fieldsExpected []logstorage.Field) {
+func TestJSONParserSuccess(t *testing.T) {
+	f := func(data string, fieldsExpected []Field) {
 		t.Helper()
 
-		p := GetParser()
+		p := GetJSONParser()
 		err := p.ParseLogMessage([]byte(data))
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
@@ -36,20 +34,24 @@ func TestParserSuccess(t *testing.T) {
 		if !reflect.DeepEqual(p.Fields, fieldsExpected) {
 			t.Fatalf("unexpected fields;\ngot\n%s\nwant\n%s", p.Fields, fieldsExpected)
 		}
-		PutParser(p)
+		PutJSONParser(p)
 	}
 
 	f("{}", nil)
-	f(`{"foo":"bar"}`, []logstorage.Field{
+	f(`{"foo":"bar"}`, []Field{
 		{
 			Name:  "foo",
 			Value: "bar",
 		},
 	})
-	f(`{"foo":{"bar":"baz"},"a":1,"b":true,"c":[1,2],"d":false}`, []logstorage.Field{
+	f(`{"foo":{"bar":{"x":"y","z":["foo"]}},"a":1,"b":true,"c":[1,2],"d":false}`, []Field{
 		{
-			Name:  "foo.bar",
-			Value: "baz",
+			Name:  "foo.bar.x",
+			Value: "y",
+		},
+		{
+			Name:  "foo.bar.z",
+			Value: `["foo"]`,
 		},
 		{
 			Name:  "a",

@@ -25,23 +25,35 @@ func (pd *pipeDelete) String() string {
 func (pd *pipeDelete) updateNeededFields(neededFields, unneededFields fieldsSet) {
 	if neededFields.contains("*") {
 		// update only unneeded fields
-		unneededFields.addAll(pd.fields)
+		unneededFields.addFields(pd.fields)
 	} else {
 		// update only needed fields
-		neededFields.removeAll(pd.fields)
+		neededFields.removeFields(pd.fields)
 	}
 }
 
-func (pd *pipeDelete) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppBase pipeProcessor) pipeProcessor {
+func (pd *pipeDelete) optimize() {
+	// nothing to do
+}
+
+func (pd *pipeDelete) hasFilterInWithQuery() bool {
+	return false
+}
+
+func (pd *pipeDelete) initFilterInValues(_ map[string][]string, _ getFieldValuesFunc) (pipe, error) {
+	return pd, nil
+}
+
+func (pd *pipeDelete) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
 	return &pipeDeleteProcessor{
 		pd:     pd,
-		ppBase: ppBase,
+		ppNext: ppNext,
 	}
 }
 
 type pipeDeleteProcessor struct {
 	pd     *pipeDelete
-	ppBase pipeProcessor
+	ppNext pipeProcessor
 }
 
 func (pdp *pipeDeleteProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -50,7 +62,7 @@ func (pdp *pipeDeleteProcessor) writeBlock(workerID uint, br *blockResult) {
 	}
 
 	br.deleteColumns(pdp.pd.fields)
-	pdp.ppBase.writeBlock(workerID, br)
+	pdp.ppNext.writeBlock(workerID, br)
 }
 
 func (pdp *pipeDeleteProcessor) flush() error {
