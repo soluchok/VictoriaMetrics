@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
@@ -370,7 +369,7 @@ type aggregator struct {
 	aggrStates []aggrState
 
 	// minTimestamp is used for ignoring old samples when ignoreOldSamples is set
-	minTimestamp atomic.Int64
+	minTimestamp int64
 
 	// time to wait after interval end before flush
 	flushAfter   *histogram.Fast
@@ -638,6 +637,12 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		skipIncompleteFlush = !*v
 	}
 
+	minTime := time.Now()
+	if skipIncompleteFlush && alignFlushToInterval {
+		minTime = minTime.Truncate(interval).Add(interval)
+	}
+	a.minTimestamp = minTime.UnixMilli()
+
 	a.wg.Add(1)
 	go func() {
 		a.runFlusher(pushFunc, alignFlushToInterval, skipIncompleteFlush, interval, dedupInterval, ignoreFirstIntervals)
@@ -782,11 +787,6 @@ func (a *aggregator) dedupFlush(dedupInterval time.Duration, deleteDeadline int6
 func (a *aggregator) flush(pushFunc PushFunc, interval time.Duration, flushTimestamp int64, idx int) {
 	startTime := time.Now()
 
-	// Update minTimestamp before flushing samples to the storage,
-	// since the flush durtion can be quite long.
-	// This should prevent from dropping samples with old timestamps when the flush takes long time.
-	a.minTimestamp.Store(startTime.UnixMilli() - 5_000)
-
 	var wg sync.WaitGroup
 	for _, as := range a.aggrStates {
 		flushConcurrencyCh <- struct{}{}
@@ -844,7 +844,6 @@ func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
 	dropLabels := a.dropInputLabels
 	ignoreOldSamples := a.ignoreOldSamples
 	var flushIdx int
-	minTimestamp := a.minTimestamp.Load()
 	for idx, ts := range tss {
 		if !a.match.Match(ts.Labels) {
 			continue
@@ -882,7 +881,7 @@ func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
 				a.ignoredNanSamples.Inc()
 				continue
 			}
-			if ignoreOldSamples && sample.Timestamp < minTimestamp {
+			if ignoreOldSamples && sample.Timestamp < a.minTimestamp {
 				// Skip old samples outside the current aggregation interval
 				a.ignoredOldSamples.Inc()
 				continue
