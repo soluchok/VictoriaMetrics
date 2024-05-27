@@ -4,12 +4,10 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/streamaggr"
-	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
@@ -82,47 +80,31 @@ func HasAnyStreamAggrConfigured() bool {
 }
 
 func reloadStreamAggrConfigs() {
-	reloadStreamAggrConfig(-1, pushToRemoteStoragesDropFailed)
-	for idx, rwctx := range rwctxs {
-		reloadStreamAggrConfig(idx, rwctx.pushInternalTrackDropped)
+	reloadStreamAggrConfig(-1)
+	for idx := range rwctxs {
+		reloadStreamAggrConfig(idx)
 	}
 }
 
-func reloadStreamAggrConfig(idx int, pushFunc streamaggr.PushFunc) {
-	path, opts := getStreamAggrOpts(idx)
-	logger.Infof("reloading stream aggregation configs pointed by -remoteWrite.streamAggr.config=%q", path)
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reloads_total{path=%q}`, path)).Inc()
-
-	sasNew, err := newStreamAggrConfigWithOpts(pushFunc, path, opts)
-	if err != nil {
-		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reloads_errors_total{path=%q}`, path)).Inc()
-		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_successful{path=%q}`, path)).Set(0)
-		logger.Errorf("cannot reload stream aggregation config at %q; continue using the previously loaded config; error: %s", path, err)
-		return
-	}
-
+func reloadStreamAggrConfig(idx int) {
+	path, _ := getStreamAggrOpts(idx)
 	var sas *streamaggr.Aggregators
+	var flag string
+
 	if idx < 0 {
+		flag = "-streamAggr.config"
 		sas = sasGlobal.Load()
 	} else {
+		flag = "-remoteWrite.streamAggr.config"
 		sas = rwctxs[idx].sas.Load()
 	}
 
-	if !sasNew.Equal(sas) {
-		var sasOld *streamaggr.Aggregators
-		if idx < 0 {
-			sasOld = sasGlobal.Swap(sasNew)
-		} else {
-			sasOld = rwctxs[idx].sas.Swap(sasNew)
-		}
-		sasOld.MustStop()
-		logger.Infof("successfully reloaded stream aggregation configs at %q", path)
-	} else {
-		sasNew.MustStop()
-		logger.Infof("successfully reloaded stream aggregation configs at %q", path)
+	logger.Infof("reloading stream aggregation configs pointed by %s=%q", flag, path)
+	if err := sas.Reload(); err != nil {
+		logger.Errorf("cannot reload %s=%q; continue using the previously loaded config; error: %s", flag, path, err)
+		return
 	}
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_successful{path=%q}`, path)).Set(1)
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_success_timestamp_seconds{path=%q}`, path)).Set(fasttime.UnixTimestamp())
+	logger.Infof("successfully reloaded stream aggregation config %s=%q", flag, path)
 }
 
 func getStreamAggrOpts(idx int) (string, *streamaggr.Options) {

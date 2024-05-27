@@ -376,7 +376,7 @@ func Stop() {
 	close(configReloaderStopCh)
 	configReloaderWG.Wait()
 
-	sasGlobal.Load().MustStop()
+	sasGlobal.Load().MustStop(nil)
 	deduplicatorGlobal.MustStop()
 	deduplicatorGlobal = nil
 
@@ -848,7 +848,7 @@ func (rwctx *remoteWriteCtx) MustStop() {
 	// sas and deduplicator must be stopped before rwctx is closed
 	// because sas can write pending series to rwctx.pss if there are any
 	sas := rwctx.sas.Swap(nil)
-	sas.MustStop()
+	sas.MustStop(nil)
 
 	if rwctx.deduplicator != nil {
 		rwctx.deduplicator.MustStop()

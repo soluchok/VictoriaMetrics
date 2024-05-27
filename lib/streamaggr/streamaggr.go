@@ -16,6 +16,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs/fscore"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
@@ -23,6 +24,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/cespare/xxhash/v2"
 	"gopkg.in/yaml.v2"
 )
 
@@ -66,21 +68,31 @@ var (
 //
 // The returned Aggregators must be stopped with MustStop() when no longer needed.
 func LoadFromFile(path string, pushFunc PushFunc, opts *Options) (*Aggregators, error) {
-	data, err := fscore.ReadFileOrHTTP(path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot load aggregators: %w", err)
+	a := &Aggregators{
+		path:     path,
+		pushFunc: pushFunc,
+		opts:     opts,
 	}
-	data, err = envtemplate.ReplaceBytes(data)
-	if err != nil {
-		return nil, fmt.Errorf("cannot expand environment variables in %q: %w", path, err)
+	if err := a.load(); err != nil {
+		return nil, fmt.Errorf("cannot initialize aggregators from %q: %w; see https://docs.victoriametrics.com/stream-aggregation/#stream-aggregation-config", a.path, err)
 	}
+	return a, nil
+}
 
-	as, err := newAggregatorsFromData(data, pushFunc, opts)
-	if err != nil {
-		return nil, fmt.Errorf("cannot initialize aggregators from %q: %w; see https://docs.victoriametrics.com/stream-aggregation/#stream-aggregation-config", path, err)
+// Reload reads config file and updates aggregators if there're any changes
+func (a *Aggregators) Reload() error {
+	if a == nil {
+		return nil
 	}
-
-	return as, nil
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_config_reloads_total{path=%q}`, a.path)).Inc()
+	if err := a.load(); err != nil {
+		metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_config_reloads_errors_total{path=%q}`, a.path)).Inc()
+		metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_config_reload_successful{path=%q}`, a.path)).Set(0)
+		return fmt.Errorf("cannot load stream aggregation config %q: %w", a.path, err)
+	}
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_config_reload_successful{path=%q}`, a.path)).Set(1)
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_config_reload_success_timestamp_seconds{path=%q}`, a.path)).Set(fasttime.UnixTimestamp())
+	return nil
 }
 
 // Options contains optional settings for the Aggregators.
@@ -234,42 +246,81 @@ type Config struct {
 
 // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
 type Aggregators struct {
-	as []*aggregator
-
-	// configData contains marshaled configs.
-	// It is used in Equal() for comparing Aggregators.
-	configData []byte
-
-	ms *metrics.Set
+	as       []*aggregator
+	ms       *metrics.Set
+	path     string
+	pushFunc PushFunc
+	opts     *Options
 }
 
-func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Aggregators, error) {
+func (a *Aggregators) load() error {
+	data, err := fscore.ReadFileOrHTTP(a.path)
+	if err != nil {
+		return fmt.Errorf("cannot load aggregators: %w", err)
+	}
+	data, err = envtemplate.ReplaceBytes(data)
+	if err != nil {
+		return fmt.Errorf("cannot expand environment variables in %q: %w", a.path, err)
+	}
+	if err = a.loadAggregatorsFromData(data); err != nil {
+		return fmt.Errorf("cannot initialize aggregators from %q: %w; see https://docs.victoriametrics.com/stream-aggregation/#stream-aggregation-config", a.path, err)
+	}
+	return nil
+}
+
+func (a *Aggregators) getAggregator(aggr *aggregator) *aggregator {
+	if a == nil {
+		return nil
+	}
+	if idx := slices.IndexFunc(a.as, func(ac *aggregator) bool {
+		return ac.configHash == aggr.configHash
+	}); idx >= 0 {
+		return a.as[idx]
+	}
+	return nil
+}
+
+func (a *Aggregators) loadAggregatorsFromData(data []byte) error {
 	var cfgs []*Config
 	if err := yaml.UnmarshalStrict(data, &cfgs); err != nil {
-		return nil, fmt.Errorf("cannot parse stream aggregation config: %w", err)
+		return fmt.Errorf("cannot parse stream aggregation config: %w", err)
 	}
 
 	ms := metrics.NewSet()
-	as := make([]*aggregator, len(cfgs))
+	var unchanged, ac []*aggregator
+	var ignoreAggrHashes []uint64
 	for i, cfg := range cfgs {
-		a, err := newAggregator(cfg, pushFunc, ms, opts)
+		aggr, err := newAggregator(cfg, a.pushFunc, ms, a.opts)
 		if err != nil {
 			// Stop already initialized aggregators before returning the error.
-			for _, a := range as[:i] {
-				a.MustStop()
+			for _, c := range ac[:i] {
+				c.MustStop()
 			}
-			return nil, fmt.Errorf("cannot initialize aggregator #%d: %w", i, err)
+			return fmt.Errorf("cannot initialize aggregator #%d: %w", i, err)
 		}
-		as[i] = a
+		if oldAgg := a.getAggregator(aggr); oldAgg != nil {
+			aggr.MustStop()
+			unchanged = append(unchanged, oldAgg)
+			ignoreAggrHashes = append(ignoreAggrHashes, oldAgg.configHash)
+			continue
+		}
+		if slices.ContainsFunc(ac, func(x *aggregator) bool {
+			return x.configHash == aggr.configHash
+		}) {
+			aggr.MustStop()
+			continue
+		}
+		ac = append(ac, aggr)
 	}
-	configData, err := json.Marshal(cfgs)
-	if err != nil {
-		logger.Panicf("BUG: cannot marshal the provided configs: %s", err)
-	}
+
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_aggregators_stopped_total{path=%q}`, a.path)).Add(len(a.as) - len(ignoreAggrHashes))
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_aggregators_created_total{path=%q}`, a.path)).Add(len(ac))
+	a.MustStop(ignoreAggrHashes)
+	a.as = slices.Concat(unchanged, ac)
 
 	_ = ms.NewGauge(`vm_streamaggr_dedup_state_size_bytes`, func() float64 {
 		n := uint64(0)
-		for _, aggr := range as {
+		for _, aggr := range a.as {
 			if aggr.da != nil {
 				n += aggr.da.sizeBytes()
 			}
@@ -278,7 +329,7 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 	})
 	_ = ms.NewGauge(`vm_streamaggr_dedup_state_items_count`, func() float64 {
 		n := uint64(0)
-		for _, aggr := range as {
+		for _, aggr := range a.as {
 			if aggr.da != nil {
 				n += aggr.da.itemsCount()
 			}
@@ -287,15 +338,12 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 	})
 
 	metrics.RegisterSet(ms)
-	return &Aggregators{
-		as:         as,
-		configData: configData,
-		ms:         ms,
-	}, nil
+	a.ms = ms
+	return nil
 }
 
 // MustStop stops a.
-func (a *Aggregators) MustStop() {
+func (a *Aggregators) MustStop(ignoreAggrHashes []uint64) {
 	if a == nil {
 		return
 	}
@@ -304,7 +352,9 @@ func (a *Aggregators) MustStop() {
 	a.ms = nil
 
 	for _, aggr := range a.as {
-		aggr.MustStop()
+		if ignoreAggrHashes == nil || !slices.Contains(ignoreAggrHashes, aggr.configHash) {
+			aggr.MustStop()
+		}
 	}
 	a.as = nil
 }
@@ -314,7 +364,16 @@ func (a *Aggregators) Equal(b *Aggregators) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return string(a.configData) == string(b.configData)
+	return slices.Compare(a.getConfigHashes(), b.getConfigHashes()) == 0
+}
+
+func (a *Aggregators) getConfigHashes() []uint64 {
+	result := make([]uint64, len(a.as))
+	for i := range result {
+		result[i] = a.as[i].configHash
+	}
+	slices.Sort(result)
+	return result
 }
 
 // Push pushes tss to a.
@@ -352,6 +411,7 @@ type aggregator struct {
 
 	keepMetricNames  bool
 	ignoreOldSamples bool
+	configHash       uint64
 
 	by                  []string
 	without             []string
@@ -445,6 +505,8 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 	dropInputLabels := opts.DropInputLabels
 	if v := cfg.DropInputLabels; v != nil {
 		dropInputLabels = *v
+	} else {
+		cfg.DropInputLabels = &dropInputLabels
 	}
 
 	// initialize input_relabel_configs and output_relabel_configs
@@ -472,6 +534,8 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 	keepMetricNames := opts.KeepMetricNames
 	if v := cfg.KeepMetricNames; v != nil {
 		keepMetricNames = *v
+	} else {
+		cfg.KeepMetricNames = &keepMetricNames
 	}
 	if keepMetricNames {
 		if len(cfg.Outputs) != 1 {
@@ -486,12 +550,16 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 	ignoreOldSamples := opts.IgnoreOldSamples
 	if v := cfg.IgnoreOldSamples; v != nil {
 		ignoreOldSamples = *v
+	} else {
+		cfg.IgnoreOldSamples = &ignoreOldSamples
 	}
 
 	// check cfg.IgnoreFirstIntervals
 	ignoreFirstIntervals := opts.IgnoreFirstIntervals
 	if v := cfg.IgnoreFirstIntervals; v != nil {
 		ignoreFirstIntervals = *v
+	} else {
+		cfg.IgnoreFirstIntervals = &ignoreFirstIntervals
 	}
 
 	// initialize outputs list
@@ -499,6 +567,8 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		return nil, fmt.Errorf("`outputs` list must contain at least a single entry from the list %s; "+
 			"see https://docs.victoriametrics.com/stream-aggregation/", supportedOutputs)
 	}
+	slices.Sort(cfg.Outputs)
+	cfg.Outputs = slices.Compact(cfg.Outputs)
 	aggrStates := make([]aggrState, len(cfg.Outputs))
 	for i, output := range cfg.Outputs {
 		if strings.HasPrefix(output, "quantiles(") {
@@ -607,19 +677,29 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		a.da = newDedupAggr()
 	}
 
-	alignFlushToInterval := !opts.NoAlignFlushToInterval
+	noAlignFlushToInterval := opts.NoAlignFlushToInterval
 	if v := cfg.NoAlignFlushToInterval; v != nil {
-		alignFlushToInterval = !*v
+		noAlignFlushToInterval = *v
+	} else {
+		cfg.NoAlignFlushToInterval = &noAlignFlushToInterval
 	}
 
-	skipIncompleteFlush := !opts.FlushOnShutdown
+	flushOnShutdown := opts.FlushOnShutdown
 	if v := cfg.FlushOnShutdown; v != nil {
-		skipIncompleteFlush = !*v
+		flushOnShutdown = *v
+	} else {
+		cfg.FlushOnShutdown = &flushOnShutdown
 	}
+
+	data, err := json.Marshal(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to marshal config: %w", err)
+	}
+	a.configHash = xxhash.Sum64(data)
 
 	a.wg.Add(1)
 	go func() {
-		a.runFlusher(pushFunc, alignFlushToInterval, skipIncompleteFlush, interval, dedupInterval, ignoreFirstIntervals)
+		a.runFlusher(pushFunc, !noAlignFlushToInterval, !flushOnShutdown, interval, dedupInterval, ignoreFirstIntervals)
 		a.wg.Done()
 	}()
 
