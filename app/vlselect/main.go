@@ -22,8 +22,8 @@ var (
 		"It shouldn't be high, since a single request can saturate all the CPU cores, while many concurrently executed requests may require high amounts of memory. "+
 		"See also -search.maxQueueDuration")
 	maxQueueDuration = flag.Duration("search.maxQueueDuration", 10*time.Second, "The maximum time the search request waits for execution when -search.maxConcurrentRequests "+
-		"limit is reached; see also -search.maxQueryDuration")
-	maxQueryDuration = flag.Duration("search.maxQueryDuration", time.Second*30, "The maximum duration for query execution. It can be overridden on a per-query basis via 'timeout' query arg")
+		"limit is reached; see also -search.maxQueryDurationVl")
+	maxQueryDuration = flag.Duration("search.maxQueryDurationVl", time.Second*30, "The maximum duration for query execution. It can be overridden on a per-query basis via 'timeout' query arg")
 )
 
 func getDefaultMaxConcurrentRequests() int {

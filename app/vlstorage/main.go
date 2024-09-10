@@ -18,14 +18,14 @@ import (
 )
 
 var (
-	retentionPeriod = flagutil.NewDuration("retentionPeriod", "7d", "Log entries with timestamps older than now-retentionPeriod are automatically deleted; "+
+	retentionPeriod = flagutil.NewDuration("retentionPeriodVl", "7d", "Log entries with timestamps older than now-retentionPeriod are automatically deleted; "+
 		"log entries with timestamps outside the retention are also rejected during data ingestion; the minimum supported retention is 1d (one day); "+
 		"see https://docs.victoriametrics.com/victorialogs/#retention ; see also -retention.maxDiskSpaceUsageBytes")
-	maxDiskSpaceUsageBytes = flagutil.NewBytes("retention.maxDiskSpaceUsageBytes", 0, "The maximum disk space usage at -storageDataPath before older per-day "+
-		"partitions are automatically dropped; see https://docs.victoriametrics.com/victorialogs/#retention-by-disk-space-usage ; see also -retentionPeriod")
+	maxDiskSpaceUsageBytes = flagutil.NewBytes("retention.maxDiskSpaceUsageBytes", 0, "The maximum disk space usage at -storageDataPathVl before older per-day "+
+		"partitions are automatically dropped; see https://docs.victoriametrics.com/victorialogs/#retention-by-disk-space-usage ; see also -retentionPeriodVl")
 	futureRetention = flagutil.NewDuration("futureRetention", "2d", "Log entries with timestamps bigger than now+futureRetention are rejected during data ingestion; "+
 		"see https://docs.victoriametrics.com/victorialogs/#retention")
-	storageDataPath = flag.String("storageDataPath", "victoria-logs-data", "Path to directory where to store VictoriaLogs data; "+
+	storageDataPath = flag.String("storageDataPathVl", "victoria-logs-data", "Path to directory where to store VictoriaLogs data; "+
 		"see https://docs.victoriametrics.com/victorialogs/#storage")
 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
@@ -35,7 +35,7 @@ var (
 		"see https://docs.victoriametrics.com/victorialogs/keyconcepts/#stream-fields ; see also -logIngestedRows")
 	logIngestedRows = flag.Bool("logIngestedRows", false, "Whether to log all the ingested log entries; this can be useful for debugging of data ingestion; "+
 		"see https://docs.victoriametrics.com/victorialogs/data-ingestion/ ; see also -logNewStreams")
-	minFreeDiskSpaceBytes = flagutil.NewBytes("storage.minFreeDiskSpaceBytes", 10e6, "The minimum free disk space at -storageDataPath after which "+
+	minFreeDiskSpaceBytes = flagutil.NewBytes("storage.minFreeDiskSpaceBytesVl", 10e6, "The minimum free disk space at -storageDataPathVl after which "+
 		"the storage stops accepting new data")
 )
 
@@ -59,7 +59,7 @@ func Init() {
 		LogIngestedRows:        *logIngestedRows,
 		MinFreeDiskSpaceBytes:  minFreeDiskSpaceBytes.N,
 	}
-	logger.Infof("opening storage at -storageDataPath=%s", *storageDataPath)
+	logger.Infof("opening storage at -storageDataPathVl=%s", *storageDataPath)
 	startTime := time.Now()
 	strg = logstorage.MustOpenStorage(*storageDataPath, cfg)
 
@@ -95,7 +95,7 @@ func CanWriteData() error {
 	if strg.IsReadOnly() {
 		return &httpserver.ErrorWithStatusCode{
 			Err: fmt.Errorf("cannot add rows into storage in read-only mode; the storage can be in read-only mode "+
-				"because of lack of free disk space at -storageDataPath=%s", *storageDataPath),
+				"because of lack of free disk space at -storageDataPathVl=%s", *storageDataPath),
 			StatusCode: http.StatusTooManyRequests,
 		}
 	}
